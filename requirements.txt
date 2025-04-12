@@ -1,0 +1,3 @@
+flask
+-e git+https://github.com/Clemens2002/ufc-data-scraper.git#egg=ufc_data_scraper
+gunicorn
