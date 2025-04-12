@@ -7,3 +7,6 @@ from ufc_data_scraper.ufc_scraper import (
 )
 
 app = Flask(__name__)
+
+# Import routes
+from . import main
