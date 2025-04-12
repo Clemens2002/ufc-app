@@ -1,5 +1,5 @@
 from ufc_data_scraper.ufc_scraper import scrape_event_url, scrape_event_fmid, get_event_fmid
-from flask import jsonify, request
+from flask import jsonify, request, Response
 import os
 from . import app
 from datetime import datetime, timedelta
@@ -14,7 +14,9 @@ def home():
             "/event/<event_fmid>",
             "/latest",
             "/upcoming",
-            "/fights/schedule"
+            "/fights/schedule",
+            "/pretty_output",
+            "/pretty_output/<int:event_fmid>"
         ]
     })
 
@@ -53,6 +55,39 @@ def get_latest_event():
         return get_event(latest_fmid)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/pretty_output')
+@app.route('/pretty_output/<int:event_fmid>')
+def pretty_output(event_fmid=None):
+    try:
+        if event_fmid is None:
+            # Default to the latest event
+            event_fmid = 1251  # Replace with the latest UFC event FMID
+        
+        event = scrape_event_fmid(event_fmid)
+        
+        output = []
+        output.append("\n📅 Event: {}\n".format(event.name))
+        
+        for segment in event.card_segments:
+            output.append("🎬 Segment: {} - Start: {}".format(segment.name, segment.start_time))
+            for fight in segment.fights:
+                fighter_names = [fs.fighter.name for fs in fight.fighters_stats]
+                output.append(" 🥋 " + " vs. ".join(fighter_names))
+                
+                if fight.result and fight.result.method:
+                    output.append("   ✅ Result: {}".format(fight.result.method))
+                    output.append("   ⏱️  Ended in round {} at {}".format(
+                        fight.result.ending_round, fight.result.ending_time))
+                else:
+                    output.append("   🕒 Status: Not yet finished")
+                
+                output.append("-" * 50)
+        
+        # Join all lines with newlines and return as text response
+        return Response("\n".join(output), mimetype='text/plain')
+    except Exception as e:
+        return Response("Error: " + str(e), mimetype='text/plain', status=500)
 
 @app.route('/upcoming')
 def get_upcoming_fights():
