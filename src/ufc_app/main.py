@@ -1,5 +1,5 @@
 from ufc_data_scraper.ufc_scraper import scrape_event_url, scrape_event_fmid, get_event_fmid
-from flask import jsonify, request, Response
+from flask import jsonify, request, Response, render_template_string
 import os
 from . import app
 from datetime import datetime, timedelta
@@ -21,6 +21,9 @@ event_ids = {
     'last_check': None  # Timestamp van de laatste check
 }
 
+# Light-weight caching voor event data
+event_cache = {}
+
 def get_event_ids():
     """Haal de event IDs op met minimale caching"""
     global event_ids
@@ -28,7 +31,7 @@ def get_event_ids():
     # Als we al een recente check hebben gedaan, gebruik die
     if event_ids['last_check'] and (datetime.now() - event_ids['last_check']).total_seconds() < 3600:
         # Als alle IDs gevuld zijn, return ze
-        if event_ids['last_finished'] and event_ids['ongoing'] and event_ids['upcoming']:
+        if event_ids['last_finished'] and (event_ids['ongoing'] is not None or event_ids['upcoming']):
             return event_ids
     
     # Anders, doe een nieuwe check
@@ -74,6 +77,11 @@ def get_event_ids():
             try:
                 event = scrape_event_fmid(event_id)
                 status_map[event_id] = event.status
+                # Cache this event while we have it
+                event_cache[event_id] = {
+                    'event': event,
+                    'timestamp': datetime.now()
+                }
             except:
                 status_map[event_id] = "Unknown"
         
@@ -116,9 +124,248 @@ def get_event_ids():
     
     return event_ids
 
+def get_event_with_cache(event_id):
+    """Haal een event op met light-weight caching"""
+    global event_cache
+    
+    # Check if we have a fresh cached version
+    if event_id in event_cache:
+        cache_entry = event_cache[event_id]
+        # If cached less than 15 minutes ago, use it
+        if (datetime.now() - cache_entry['timestamp']).total_seconds() < 900:
+            return cache_entry['event']
+    
+    # If not cached or stale, fetch fresh data
+    try:
+        event = scrape_event_fmid(event_id)
+        # Cache the result
+        event_cache[event_id] = {
+            'event': event,
+            'timestamp': datetime.now()
+        }
+        # Keep the cache size reasonable
+        if len(event_cache) > 5:
+            # Remove the oldest entry
+            oldest_id = min(event_cache.keys(), key=lambda k: event_cache[k]['timestamp'])
+            del event_cache[oldest_id]
+        return event
+    except Exception as e:
+        print(f"Error getting event {event_id}: {e}")
+        raise
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>UFC Events API</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1, h2, h3 {
+            color: #d20a0a;
+        }
+        h1 {
+            border-bottom: 2px solid #d20a0a;
+            padding-bottom: 10px;
+        }
+        .event {
+            background: white;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .event-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+        }
+        .event-title {
+            margin-top: 0;
+        }
+        .status {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        .status-completed {
+            background: #d9ffd9;
+            color: #006400;
+        }
+        .status-progress {
+            background: #ffe8cc;
+            color: #cc5500;
+        }
+        .status-upcoming {
+            background: #e6f7ff;
+            color: #0066cc;
+        }
+        .segment {
+            border-top: 1px solid #eee;
+            padding-top: 10px;
+            margin-top: 15px;
+        }
+        .segment-name {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .segment-time {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 10px;
+        }
+        .fight {
+            padding: 10px;
+            margin-bottom: 10px;
+            border-left: 3px solid #d20a0a;
+            background: #f9f9f9;
+        }
+        .fight-result {
+            margin-top: 5px;
+            font-size: 14px;
+        }
+        .result-method {
+            color: #d20a0a;
+            font-weight: bold;
+        }
+        .endpoint {
+            background: #f0f0f0;
+            padding: 8px;
+            border-radius: 4px;
+            font-family: monospace;
+            margin-right: 10px;
+            margin-bottom: 5px;
+            display: inline-block;
+        }
+        .api-info {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #ddd;
+        }
+        @media (max-width: 600px) {
+            body {
+                padding: 10px;
+            }
+            .event-header {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <h1>UFC Events API</h1>
+    
+    {% if events %}
+        {% for event_type, event_data in events.items() %}
+            {% if event_data %}
+            <div class="event">
+                <div class="event-header">
+                    <h2 class="event-title">{{ event_data.name }}</h2>
+                    {% if event_data.status == "Completed" %}
+                        <span class="status status-completed">{{ event_data.status }}</span>
+                    {% elif event_data.status == "In Progress" %}
+                        <span class="status status-progress">{{ event_data.status }}</span>
+                    {% else %}
+                        <span class="status status-upcoming">{{ event_data.status }}</span>
+                    {% endif %}
+                </div>
+                
+                <h3>{{ event_type | replace('_', ' ') | title }}</h3>
+                
+                {% for segment in event_data.segments %}
+                    <div class="segment">
+                        <div class="segment-name">{{ segment.name }}</div>
+                        <div class="segment-time">Start: {{ segment.start_time }}</div>
+                        
+                        {% for fight in segment.fights %}
+                            <div class="fight">
+                                <div class="fight-matchup">{{ " vs. ".join(fight.fighters) }}</div>
+                                
+                                {% if fight.result and fight.result.method %}
+                                    <div class="fight-result">
+                                        <span class="result-method">{{ fight.result.method }}</span>
+                                        - Round {{ fight.result.ending_round }} at {{ fight.result.ending_time }}
+                                    </div>
+                                {% else %}
+                                    <div class="fight-result">Status: Not yet finished</div>
+                                {% endif %}
+                            </div>
+                        {% endfor %}
+                    </div>
+                {% endfor %}
+            </div>
+            {% endif %}
+        {% endfor %}
+    {% else %}
+        <p>No events data available.</p>
+    {% endif %}
+    
+    <div class="api-info">
+        <h3>API Endpoints</h3>
+        <div>
+            <div class="endpoint">/latest</div>
+            <div class="endpoint">/ongoing</div>
+            <div class="endpoint">/upcoming</div>
+            <div class="endpoint">/last_finished</div>
+            <div class="endpoint">/pretty_output/ongoing</div>
+            <div class="endpoint">/pretty_output/upcoming</div>
+            <div class="endpoint">/pretty_output/last_finished</div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
 @app.route('/')
 def home():
-    # We doen geen zware berekeningen in de homepage
+    # Get all events data with only one request
+    try:
+        ids = get_event_ids()
+        events = {}
+        
+        # Get the last finished event
+        if ids['last_finished']:
+            try:
+                last_finished_event = get_event_with_cache(ids['last_finished'])
+                events['last_finished'] = format_event_for_template(last_finished_event)
+            except:
+                pass
+                
+        # Get the ongoing event
+        if ids['ongoing']:
+            try:
+                ongoing_event = get_event_with_cache(ids['ongoing'])
+                events['ongoing'] = format_event_for_template(ongoing_event)
+            except:
+                pass
+        
+        # Get the upcoming event
+        if ids['upcoming']:
+            try:
+                upcoming_event = get_event_with_cache(ids['upcoming'])
+                events['upcoming'] = format_event_for_template(upcoming_event)
+            except:
+                pass
+        
+        # Return HTML response if events were loaded successfully
+        if events:
+            return render_template_string(HTML_TEMPLATE, events=events)
+        
+    except:
+        pass
+    
+    # Fallback to JSON if anything fails
     return jsonify({
         "status": "online",
         "message": "UFC Data API is running",
@@ -132,6 +379,39 @@ def home():
             "/pretty_output/upcoming"  # Prettig leesbare versie van aankomend event
         ]
     })
+
+def format_event_for_template(event):
+    """Format event data for the HTML template"""
+    segments = []
+    for segment in event.card_segments:
+        fights = []
+        for fight in segment.fights:
+            fighter_names = [fs.fighter.name for fs in fight.fighters_stats]
+            fight_data = {
+                "fighters": fighter_names,
+                "result": None
+            }
+            
+            if fight.result and fight.result.method:
+                fight_data["result"] = {
+                    "method": fight.result.method,
+                    "ending_round": fight.result.ending_round,
+                    "ending_time": fight.result.ending_time
+                }
+            
+            fights.append(fight_data)
+            
+        segments.append({
+            "name": segment.name,
+            "start_time": segment.start_time,
+            "fights": fights
+        })
+    
+    return {
+        "name": event.name,
+        "status": event.status,
+        "segments": segments
+    }
 
 def get_event_json(event):
     """Zet een event om in JSON"""
@@ -166,7 +446,7 @@ def get_latest_event():
         event_id = ids['ongoing'] if ids['ongoing'] else ids['upcoming']
         
         # Haal het event op
-        event = scrape_event_fmid(event_id)
+        event = get_event_with_cache(event_id)
         return jsonify(get_event_json(event))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -181,7 +461,7 @@ def get_ongoing_event():
             return jsonify({"error": "No ongoing event found"}), 404
         
         # Haal het event op
-        event = scrape_event_fmid(ids['ongoing'])
+        event = get_event_with_cache(ids['ongoing'])
         return jsonify(get_event_json(event))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -196,7 +476,7 @@ def get_upcoming_event():
             return jsonify({"error": "No upcoming event found"}), 404
         
         # Haal het event op
-        event = scrape_event_fmid(ids['upcoming'])
+        event = get_event_with_cache(ids['upcoming'])
         return jsonify(get_event_json(event))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -211,7 +491,7 @@ def get_last_finished_event():
             return jsonify({"error": "No finished event found"}), 404
         
         # Haal het event op
-        event = scrape_event_fmid(ids['last_finished'])
+        event = get_event_with_cache(ids['last_finished'])
         return jsonify(get_event_json(event))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -250,7 +530,7 @@ def pretty_output_ongoing():
             return Response("Geen lopend event gevonden", mimetype='text/plain', status=404)
         
         # Haal het event op
-        event = scrape_event_fmid(ids['ongoing'])
+        event = get_event_with_cache(ids['ongoing'])
         return Response(get_pretty_output(event), mimetype='text/plain')
     except Exception as e:
         return Response("Error: " + str(e), mimetype='text/plain', status=500)
@@ -265,7 +545,7 @@ def pretty_output_upcoming():
             return Response("Geen aankomend event gevonden", mimetype='text/plain', status=404)
         
         # Haal het event op
-        event = scrape_event_fmid(ids['upcoming'])
+        event = get_event_with_cache(ids['upcoming'])
         return Response(get_pretty_output(event), mimetype='text/plain')
     except Exception as e:
         return Response("Error: " + str(e), mimetype='text/plain', status=500)
@@ -280,7 +560,7 @@ def pretty_output_last_finished():
             return Response("Geen afgelopen event gevonden", mimetype='text/plain', status=404)
         
         # Haal het event op
-        event = scrape_event_fmid(ids['last_finished'])
+        event = get_event_with_cache(ids['last_finished'])
         return Response(get_pretty_output(event), mimetype='text/plain')
     except Exception as e:
         return Response("Error: " + str(e), mimetype='text/plain', status=500)
@@ -300,7 +580,7 @@ def get_fights_schedule():
         event_id = ids['ongoing'] if ids['ongoing'] else ids['upcoming']
         
         # Direct scrapen
-        event = scrape_event_fmid(event_id)
+        event = get_event_with_cache(event_id)
         
         all_fights = []
         
