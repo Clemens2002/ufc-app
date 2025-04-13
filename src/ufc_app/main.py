@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import pytz
 import time
 import requests
+from bs4 import BeautifulSoup
 
 # Constante waarden voor event IDs
 DEFAULT_LAST_EVENT_ID = 1250
@@ -162,6 +163,8 @@ def home():
         output.append("  - /event/1250 (Vorig event)")
         output.append("  - /event/1251 (Huidig event)")
         output.append("  - /event/1252 (Volgend event)")
+        output.append("  - /debug/live-detection (Test live detection)")
+        output.append("  - /debug/simulate-live (Simuleer live event)")
         
         # Als we geen live gevecht gevonden hebben, voeg een notitie toe
         if not found_live_fight and event.status == "In Progress":
@@ -229,6 +232,174 @@ def get_event(event_fmid):
         return jsonify(result_json)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/debug/live-detection')
+def debug_live_detection():
+    try:
+        event = scrape_event_fmid(DEFAULT_CURRENT_EVENT_ID)
+        debug_info = []
+        debug_info.append(f"Event: {event.name}")
+        debug_info.append(f"Status: {event.status}")
+        
+        # Controleer UFC.com rechtstreeks
+        try:
+            response = requests.get("https://www.ufc.com/events", timeout=5)
+            if response.status_code == 200:
+                if "LIVE NOW" in response.text:
+                    debug_info.append("UFC.com toont 'LIVE NOW' indicator")
+                else:
+                    debug_info.append("Geen 'LIVE NOW' indicator gevonden op UFC.com")
+                    
+                # Zoek specifieke HTML elementen
+                soup = BeautifulSoup(response.text, 'html.parser')
+                live_elements = soup.find_all(string=lambda text: text and 'live' in text.lower())
+                debug_info.append(f"Aantal elementen met 'live' tekst: {len(live_elements)}")
+                for i, elem in enumerate(live_elements[:5]):  # Toon eerste 5
+                    debug_info.append(f"  - Live element {i+1}: {elem.strip()}")
+        except Exception as e:
+            debug_info.append(f"Fout bij het controleren van UFC.com: {str(e)}")
+        
+        # Analyseer alle gevechten
+        for segment in event.card_segments:
+            debug_info.append(f"\nSegment: {segment.name}, Start: {segment.start_time}")
+            
+            for i, fight in enumerate(segment.fights):
+                fighter_names = [fs.fighter.name for fs in fight.fighters_stats]
+                fighters_str = " vs. ".join(fighter_names)
+                
+                # Test de volledige detectielogica
+                is_live = is_fight_live(fight, segment, event)
+                
+                # Bekijk details waarom wel/niet live
+                has_result = bool(fight.result and fight.result.method)
+                
+                debug_info.append(f"Fight {i+1}: {fighters_str}")
+                debug_info.append(f"  - Has Result: {has_result}")
+                debug_info.append(f"  - Result: {fight.result.method if has_result else 'None'}")
+                debug_info.append(f"  - Is Live: {is_live}")
+                
+                # Check vorige en volgende gevechten
+                if i > 0:
+                    prev_fight = segment.fights[i-1]
+                    prev_complete = bool(prev_fight.result and prev_fight.result.method)
+                    debug_info.append(f"  - Previous fight complete: {prev_complete}")
+                
+                if i < len(segment.fights) - 1:
+                    next_fight = segment.fights[i+1]
+                    next_complete = bool(next_fight.result and next_fight.result.method)
+                    debug_info.append(f"  - Next fight complete: {next_complete}")
+        
+        return Response("\n".join(debug_info), mimetype="text/plain")
+    except Exception as e:
+        return f"Error in debug: {str(e)}"
+
+@app.route('/debug/simulate-live')
+def debug_simulate_live():
+    # Simuleer live event detectie
+    try:
+        event_id = DEFAULT_CURRENT_EVENT_ID
+        
+        # Gebruik query parameter als die er is
+        if request.args.get('event_id'):
+            try:
+                event_id = int(request.args.get('event_id'))
+            except:
+                pass
+                
+        event = scrape_event_fmid(event_id)
+        
+        debug_info = []
+        debug_info.append(f"Event: {event.name}")
+        debug_info.append(f"Originele Status: {event.status}")
+        
+        # Maak een kopie van de belangrijkste eigenschappen (kan niet direct wijzigen door frozen=True)
+        event_info = {
+            "naam": event.name,
+            "status": "In Progress",  # Gesimuleerde status
+            "originele_status": event.status
+        }
+        debug_info.append(f"Gesimuleerde Status: In Progress")
+        
+        # Zoek een geschikt gevecht om te simuleren als "live"
+        live_fight_found = False
+        
+        for segment in event.card_segments:
+            debug_info.append(f"\nSegment: {segment.name}")
+            
+            for i, fight in enumerate(segment.fights):
+                fighter_names = [fs.fighter.name for fs in fight.fighters_stats]
+                fighters_str = " vs. ".join(fighter_names)
+                
+                # Voor gesimuleerde detectie, zoek naar een niet-afgemaakt gevecht
+                if not (fight.result and fight.result.method):
+                    # Als dit gevecht geen resultaat heeft, maar voorgaande wel
+                    is_candidate = True
+                    
+                    # Check of alle voorgaande gevechten resultaten hebben
+                    for j in range(0, i):
+                        prev_fight = segment.fights[j]
+                        if not (prev_fight.result and prev_fight.result.method):
+                            is_candidate = False
+                            break
+                            
+                    if is_candidate:
+                        live_fight_found = True
+                        debug_info.append(f"Gesimuleerd LIVE fight: {fighters_str}")
+                        debug_info.append("  (Dit gevecht zou als LIVE gemarkeerd worden als het event 'In Progress' was)")
+                        
+                        # Geef details 
+                        debug_info.append(f"  - Fight positie: {i+1} van {len(segment.fights)}")
+                        debug_info.append(f"  - Voorgaande gevechten hebben resultaten: Ja")
+                        if i < len(segment.fights) - 1:
+                            has_next = "Ja"
+                            next_fight = segment.fights[i+1]
+                            next_has_results = bool(next_fight.result and next_fight.result.method)
+                            debug_info.append(f"  - Volgende gevecht heeft resultaat: {next_has_results}")
+                        else:
+                            debug_info.append(f"  - Laatste gevecht in segment: Ja")
+                        
+                        break
+            
+            if live_fight_found:
+                break
+        
+        if not live_fight_found:
+            debug_info.append("\nGeen geschikt gevecht gevonden om als LIVE te simuleren.")
+            
+            # Zoek niet-afgeronde gevechten om te analyseren waarom ze niet als live worden gedetecteerd
+            no_result_fights = []
+            for segment in event.card_segments:
+                for i, fight in enumerate(segment.fights):
+                    if not (fight.result and fight.result.method):
+                        fighter_names = [fs.fighter.name for fs in fight.fighters_stats]
+                        fighters_str = " vs. ".join(fighter_names)
+                        no_result_fights.append((segment.name, i, fighters_str))
+            
+            if no_result_fights:
+                debug_info.append("\nGevechten zonder resultaat die niet als LIVE worden gedetecteerd:")
+                for seg_name, idx, fighters in no_result_fights:
+                    debug_info.append(f" - {seg_name}, Gevecht {idx+1}: {fighters}")
+                    
+                    # Geef mogelijke redenen
+                    if idx > 0:
+                        segment = next((s for s in event.card_segments if s.name == seg_name), None)
+                        if segment:
+                            prev_fight = segment.fights[idx-1]
+                            if not (prev_fight.result and prev_fight.result.method):
+                                debug_info.append(f"   Reden: Voorgaand gevecht heeft geen resultaat")
+            else:
+                debug_info.append("Alle gevechten hebben resultaten (afgelopen event).")
+        
+        # Instructies voor gebruik
+        debug_info.append("\n\nInstructies voor testen tijdens een live event:")
+        debug_info.append("1. Controleer de UFC website om te zien welk gevecht live is")
+        debug_info.append("2. Ga naar /debug/live-detection om te zien of dat gevecht correct wordt gedetecteerd")
+        debug_info.append("3. Als het event status 'In Progress' heeft maar geen gevecht als live is gemarkeerd,")
+        debug_info.append("   controleer dan of de detectielogica correct functioneert")
+        
+        return Response("\n".join(debug_info), mimetype="text/plain")
+    except Exception as e:
+        return f"Error in simulation: {str(e)}"
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
