@@ -7,11 +7,95 @@ import pytz
 import time
 import requests
 from bs4 import BeautifulSoup
+import json
+import threading
+import logging
 
 # Constante waarden voor event IDs
 DEFAULT_LAST_EVENT_ID = 1250
 DEFAULT_CURRENT_EVENT_ID = 1251
 DEFAULT_NEXT_EVENT_ID = 1252
+
+# Light-weight caching zonder externe afhankelijkheden
+event_cache = {}
+last_check_time = None
+CACHE_EXPIRY = 300  # 5 minuten cache expiry
+
+# Configureer logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('ufc_app')
+
+def get_event_with_cache(event_id):
+    """Haal event op met caching voor betere prestaties"""
+    global event_cache, last_check_time
+    
+    current_time = datetime.now()
+    
+    # Als er een geldige cache is, gebruik die
+    if event_id in event_cache:
+        cache_time, cached_event = event_cache[event_id]
+        # Als de cache nog vers is (< 5 minuten oud)
+        if (current_time - cache_time).total_seconds() < CACHE_EXPIRY:
+            logger.info(f"Cache hit voor event {event_id}")
+            return cached_event
+    
+    # Anders, haal verse data op
+    try:
+        logger.info(f"Cache miss voor event {event_id}, ophalen verse data")
+        event = scrape_event_fmid(event_id)
+        # Update de cache
+        event_cache[event_id] = (current_time, event)
+        last_check_time = current_time
+        
+        # Houd de cache-grootte beperkt
+        if len(event_cache) > 5:
+            # Verwijder de oudste entry
+            oldest_id = min(event_cache.keys(), 
+                           key=lambda k: event_cache[k][0])
+            del event_cache[oldest_id]
+            
+        return event
+    except Exception as e:
+        logger.error(f"Fout bij ophalen event {event_id}: {str(e)}")
+        # Als er een fout optreedt en we hebben een verouderde cache, gebruik die als fallback
+        if event_id in event_cache:
+            logger.info(f"Gebruik verouderde cache als fallback voor event {event_id}")
+            return event_cache[event_id][1]
+        raise
+
+def refresh_current_event():
+    """Ververs de huidige event data in de achtergrond"""
+    try:
+        event = get_event_with_cache(DEFAULT_CURRENT_EVENT_ID)
+        logger.info(f"Event {DEFAULT_CURRENT_EVENT_ID} ververst: {event.name}, status: {event.status}")
+        
+        # Controleer en log live gevechten
+        for segment in event.card_segments:
+            for fight in segment.fights:
+                if is_fight_live(fight, segment, event):
+                    fighter_names = [fs.fighter.name for fs in fight.fighters_stats]
+                    fighters_str = " vs. ".join(fighter_names)
+                    logger.info(f"LIVE GEVECHT GEDETECTEERD: {fighters_str} in {segment.name}")
+    except Exception as e:
+        logger.error(f"Fout bij verversen event data: {str(e)}")
+
+def start_background_refresh():
+    """Start een achtergrondthread om event data te verversen"""
+    def refresh_thread():
+        while True:
+            refresh_current_event()
+            time.sleep(CACHE_EXPIRY)  # Wacht 5 minuten tussen verversingen
+            
+    thread = threading.Thread(target=refresh_thread, daemon=True)
+    thread.start()
+    logger.info("Achtergrond verversing gestart")
+
+# Start de achtergrond verversing als we in een productie omgeving zijn
+if not os.environ.get('FLASK_DEBUG'):
+    start_background_refresh()
 
 def is_fight_live(fight, segment, event):
     """
@@ -127,7 +211,7 @@ def check_ufc_site_for_live_status(fight):
 def home():
     try:
         # Haal direct het huidige event op
-        event = scrape_event_fmid(DEFAULT_CURRENT_EVENT_ID)
+        event = get_event_with_cache(DEFAULT_CURRENT_EVENT_ID)
         
         # Maak een eenvoudige tekst weergave
         output = []
@@ -165,6 +249,7 @@ def home():
         output.append("  - /event/1252 (Volgend event)")
         output.append("  - /debug/live-detection (Test live detection)")
         output.append("  - /debug/simulate-live (Simuleer live event)")
+        output.append("  - /api/status (API status en cache info)")
         
         # Als we geen live gevecht gevonden hebben, voeg een notitie toe
         if not found_live_fight and event.status == "In Progress":
@@ -176,6 +261,7 @@ def home():
         # Retourneer als plain text
         return Response("\n".join(output), mimetype='text/plain')
     except Exception as e:
+        logger.error(f"Fout in home endpoint: {str(e)}")
         # Fallback naar JSON in geval van fouten
         return jsonify({
             "status": "online",
@@ -191,7 +277,7 @@ def home():
 @app.route('/event/<int:event_fmid>')
 def get_event(event_fmid):
     try:
-        event = scrape_event_fmid(event_fmid)
+        event = get_event_with_cache(event_fmid)
         
         # Bereid de JSON data voor
         result_json = {
@@ -231,15 +317,47 @@ def get_event(event_fmid):
         
         return jsonify(result_json)
     except Exception as e:
+        logger.error(f"Fout in get_event endpoint voor event {event_fmid}: {str(e)}")
         return jsonify({"error": str(e)}), 500
+
+@app.route('/api/status')
+def api_status():
+    """Endpoint om API status en cache informatie te tonen"""
+    global event_cache, last_check_time
+    
+    cache_info = []
+    for event_id, (cache_time, event) in event_cache.items():
+        age = (datetime.now() - cache_time).total_seconds()
+        cache_info.append({
+            "event_id": event_id,
+            "event_name": event.name,
+            "cache_age_seconds": round(age),
+            "fresh": age < CACHE_EXPIRY
+        })
+    
+    return jsonify({
+        "status": "online",
+        "last_check": last_check_time.isoformat() if last_check_time else None,
+        "cache_expiry_seconds": CACHE_EXPIRY,
+        "cached_events": cache_info,
+        "version": "1.2.0",
+        "background_refresh_active": not os.environ.get('FLASK_DEBUG')
+    })
 
 @app.route('/debug/live-detection')
 def debug_live_detection():
     try:
-        event = scrape_event_fmid(DEFAULT_CURRENT_EVENT_ID)
+        event = get_event_with_cache(DEFAULT_CURRENT_EVENT_ID)
         debug_info = []
         debug_info.append(f"Event: {event.name}")
         debug_info.append(f"Status: {event.status}")
+        
+        # Cache status
+        global event_cache, last_check_time
+        if last_check_time:
+            cache_age = (datetime.now() - last_check_time).total_seconds()
+            debug_info.append(f"Cache Last Updated: {last_check_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            debug_info.append(f"Cache Age: {round(cache_age)} seconds (expires at {CACHE_EXPIRY} seconds)")
         
         # Controleer UFC.com rechtstreeks
         try:
@@ -291,6 +409,7 @@ def debug_live_detection():
         
         return Response("\n".join(debug_info), mimetype="text/plain")
     except Exception as e:
+        logger.error(f"Fout in debug endpoint: {str(e)}")
         return f"Error in debug: {str(e)}"
 
 @app.route('/debug/simulate-live')
@@ -306,7 +425,7 @@ def debug_simulate_live():
             except:
                 pass
                 
-        event = scrape_event_fmid(event_id)
+        event = get_event_with_cache(event_id)
         
         debug_info = []
         debug_info.append(f"Event: {event.name}")
@@ -399,6 +518,7 @@ def debug_simulate_live():
         
         return Response("\n".join(debug_info), mimetype="text/plain")
     except Exception as e:
+        logger.error(f"Fout in simulatie endpoint: {str(e)}")
         return f"Error in simulation: {str(e)}"
 
 if __name__ == "__main__":
