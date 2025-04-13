@@ -12,15 +12,50 @@ DEFAULT_NEXT_EVENT_ID = 1252
 
 @app.route('/')
 def home():
-    return jsonify({
-        "status": "online",
-        "message": "UFC Data API is running",
-        "endpoints": [
-            "/event/1250",  # Laatste event (voorbeeld)
-            "/event/1251",  # Huidige event (voorbeeld)
-            "/event/1252",  # Volgende event (voorbeeld)
-        ]
-    })
+    try:
+        # Haal direct het huidige event op
+        event = scrape_event_fmid(DEFAULT_CURRENT_EVENT_ID)
+        
+        # Maak een eenvoudige tekst weergave
+        output = []
+        output.append("\n📅 UFC Event: {}\n".format(event.name))
+        output.append("📊 Status: {}\n".format(event.status))
+        
+        for segment in event.card_segments:
+            output.append("🎬 {} - Start: {}".format(segment.name, segment.start_time))
+            for fight in segment.fights:
+                fighter_names = [fs.fighter.name for fs in fight.fighters_stats]
+                output.append(" 🥋 " + " vs. ".join(fighter_names))
+                
+                if fight.result and fight.result.method:
+                    output.append("   ✅ Result: {}".format(fight.result.method))
+                    output.append("   ⏱️  Ended in round {} at {}".format(
+                        fight.result.ending_round, fight.result.ending_time))
+                else:
+                    output.append("   🕒 Status: Not yet finished")
+                
+                output.append("-" * 50)
+        
+        # Voeg informatie over andere endpoints toe
+        output.append("\n🔗 Andere endpoints:")
+        output.append("  - /event/1250 (Vorig event)")
+        output.append("  - /event/1251 (Huidig event)")
+        output.append("  - /event/1252 (Volgend event)")
+        
+        # Retourneer als plain text
+        return Response("\n".join(output), mimetype='text/plain')
+    except Exception as e:
+        # Fallback naar JSON in geval van fouten
+        return jsonify({
+            "status": "online",
+            "message": "UFC Data API is running",
+            "endpoints": [
+                "/event/1250",  # Laatste event (voorbeeld)
+                "/event/1251",  # Huidige event (voorbeeld)
+                "/event/1252",  # Volgende event (voorbeeld)
+            ],
+            "error": str(e)
+        })
 
 @app.route('/event/<int:event_fmid>')
 def get_event(event_fmid):
