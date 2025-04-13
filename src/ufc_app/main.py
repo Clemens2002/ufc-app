@@ -1,9 +1,158 @@
 from ufc_data_scraper.ufc_scraper import scrape_event_url, scrape_event_fmid, get_event_fmid
 from flask import jsonify, request, Response
 import os
+import requests
+from bs4 import BeautifulSoup
 from . import app
 from datetime import datetime, timedelta
 import pytz
+import json
+import os.path
+import threading
+import time
+
+# Cache voor UFC events om te voorkomen dat we constant dezelfde data scrapen
+EVENT_CACHE = {}
+# Cache voor het ID van de meest recente event
+LATEST_EVENT_ID = None
+# Maximum aantal events om in cache te houden
+MAX_CACHE_SIZE = 10
+# Pad naar bestand met opgeslagen historische events
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ufc_history.json')
+
+# Laad historische events uit het bestand, als het bestaat
+def load_history():
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, 'r') as f:
+                return json.load(f)
+        return {}
+    except Exception as e:
+        print(f"Error loading history: {e}")
+        return {}
+
+# Sla historische events op in het bestand
+def save_history(history):
+    try:
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(history, f)
+    except Exception as e:
+        print(f"Error saving history: {e}")
+
+# Haal de meest recente UFC event ID op
+def get_latest_ufc_event_id():
+    global LATEST_EVENT_ID
+    
+    if LATEST_EVENT_ID is not None:
+        return LATEST_EVENT_ID
+    
+    try:
+        # Scrape de UFC site voor de meest recente event ID
+        response = requests.get("https://www.ufc.com/events")
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Zoek naar de eerste aankomende event (of meest recente)
+            event_links = soup.select('.c-card-event--result__headline a')
+            if event_links:
+                # Pak de URL en haal de event ID eruit
+                event_url = event_links[0]['href']
+                if event_url.startswith('/event/'):
+                    # Scrape het event om het FMID te krijgen
+                    event = scrape_event_url(f"https://www.ufc.com{event_url}")
+                    if event and hasattr(event, 'fmid'):
+                        LATEST_EVENT_ID = event.fmid
+                        return event.fmid
+        
+        # Als we hier komen, konden we geen event ID vinden, gebruik een standaard waarde
+        return 1251  # Standaard UFC event ID als fallback
+    except Exception as e:
+        print(f"Error finding latest event: {e}")
+        return 1251  # Standaard UFC event ID als fallback
+
+# Cache een event
+def cache_event(event_id, event):
+    global EVENT_CACHE
+    
+    # Voeg toe aan cache
+    EVENT_CACHE[event_id] = {
+        "timestamp": datetime.now(),
+        "event": event
+    }
+    
+    # Houd cache grootte in de gaten
+    if len(EVENT_CACHE) > MAX_CACHE_SIZE:
+        # Verwijder de oudste entry
+        oldest = min(EVENT_CACHE.items(), key=lambda x: x[1]["timestamp"])
+        del EVENT_CACHE[oldest[0]]
+
+# Scrape een event met caching
+def get_event_with_cache(event_id):
+    global EVENT_CACHE
+    
+    # Controleer of het event in de cache zit en niet te oud is
+    if event_id in EVENT_CACHE:
+        cached = EVENT_CACHE[event_id]
+        # Als de cache minder dan een uur oud is, gebruik deze
+        if (datetime.now() - cached["timestamp"]).total_seconds() < 3600:
+            return cached["event"]
+    
+    # Anders, scrape het event
+    event = scrape_event_fmid(event_id)
+    
+    # Cache het event
+    cache_event(event_id, event)
+    
+    # Sla het event op in de geschiedenis als het volledig is
+    if event.status == 'Completed':
+        history = load_history()
+        history[str(event_id)] = {
+            "name": event.name,
+            "date": str(event.card_segments[0].start_time if event.card_segments else None),
+            "segments": [{
+                "name": segment.name,
+                "fights": [{
+                    "fighters": [fs.fighter.name for fs in fight.fighters_stats],
+                    "result": {
+                        "method": fight.result.method if fight.result else None,
+                        "ending_round": fight.result.ending_round if fight.result else None,
+                        "ending_time": str(fight.result.ending_time) if fight.result else None
+                    } if fight.result else None
+                } for fight in segment.fights]
+            } for segment in event.card_segments]
+        }
+        save_history(history)
+    
+    return event
+
+# Achtergrond taak om periodiek events te controleren en bij te werken
+def background_task():
+    while True:
+        try:
+            # Haal de meest recente event ID op
+            latest_id = get_latest_ufc_event_id()
+            
+            # Update de cache met de nieuwste event
+            if latest_id:
+                event = get_event_with_cache(latest_id)
+                
+                # Als het een voltooide event is, probeer ook de volgende te vinden
+                if event.status == 'Completed':
+                    # Probeer de volgende event te vinden (meestal +1)
+                    try:
+                        next_event = scrape_event_fmid(latest_id + 1)
+                        if next_event:
+                            cache_event(latest_id + 1, next_event)
+                    except:
+                        pass
+        except Exception as e:
+            print(f"Error in background task: {e}")
+        
+        # Wacht 30 minuten voor de volgende controle
+        time.sleep(1800)
+
+# Start de achtergrond taak
+threading.Thread(target=background_task, daemon=True).start()
 
 @app.route('/')
 def home():
@@ -16,14 +165,15 @@ def home():
             "/upcoming",
             "/fights/schedule",
             "/pretty_output",
-            "/pretty_output/<int:event_fmid>"
+            "/pretty_output/<int:event_fmid>",
+            "/history"
         ]
     })
 
 @app.route('/event/<int:event_fmid>')
 def get_event(event_fmid):
     try:
-        event = scrape_event_fmid(event_fmid)
+        event = get_event_with_cache(event_fmid)
         return jsonify({
             "name": event.name,
             "status": event.status,
@@ -50,9 +200,16 @@ def get_event(event_fmid):
 @app.route('/latest')
 def get_latest_event():
     try:
-        # This is a placeholder - you might need to implement a way to find the latest event
-        latest_fmid = 1251  # Replace with the latest UFC event FMID
+        latest_fmid = get_latest_ufc_event_id()
         return get_event(latest_fmid)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/history')
+def get_history():
+    try:
+        history = load_history()
+        return jsonify(history)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -62,9 +219,9 @@ def pretty_output(event_fmid=None):
     try:
         if event_fmid is None:
             # Default to the latest event
-            event_fmid = 1251  # Replace with the latest UFC event FMID
+            event_fmid = get_latest_ufc_event_id()
         
-        event = scrape_event_fmid(event_fmid)
+        event = get_event_with_cache(event_fmid)
         
         output = []
         output.append("\n📅 Event: {}\n".format(event.name))
@@ -95,9 +252,9 @@ def get_upcoming_fights():
         # Get the current time in UTC
         now = datetime.now(pytz.UTC)
         
-        # This is a placeholder - you might need to implement a way to find the latest event
-        latest_fmid = 1251  # Replace with the latest UFC event FMID
-        event = scrape_event_fmid(latest_fmid)
+        # Get the latest event
+        latest_fmid = get_latest_ufc_event_id()
+        event = get_event_with_cache(latest_fmid)
         
         upcoming_fights = []
         
@@ -141,9 +298,9 @@ def get_fights_schedule():
         except:
             timezone = pytz.UTC
             
-        # This is a placeholder - you might need to implement a way to find the latest event
-        latest_fmid = 1251  # Replace with the latest UFC event FMID
-        event = scrape_event_fmid(latest_fmid)
+        # Get the latest event
+        latest_fmid = get_latest_ufc_event_id()
+        event = get_event_with_cache(latest_fmid)
         
         all_fights = []
         
