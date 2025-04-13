@@ -18,9 +18,13 @@ LATEST_EVENT_ID = None
 # Cache voor het ID van het laatste afgelopen event
 LAST_COMPLETED_EVENT_ID = None
 # Maximum aantal events om in cache te houden
-MAX_CACHE_SIZE = 10
+MAX_CACHE_SIZE = 5
 # Pad naar bestand met opgeslagen historische events
 HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ufc_history.json')
+# Flag om aan te geven of de achtergrond taak al draait
+BACKGROUND_TASK_RUNNING = False
+# Thread voor de achtergrondtaak
+BACKGROUND_THREAD = None
 
 # Laad historische events uit het bestand, als het bestaat
 def load_history():
@@ -41,16 +45,30 @@ def save_history(history):
     except Exception as e:
         print(f"Error saving history: {e}")
 
+# Veilig requests met timeouts en retries
+def safe_request(url, max_retries=3, timeout=10):
+    for attempt in range(max_retries):
+        try:
+            return requests.get(url, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                raise e
+            time.sleep(1)  # Wacht even voordat je het opnieuw probeert
+
 # Haal de meest recente UFC event ID op (aankomend of lopend)
 def get_latest_ufc_event_id():
     global LATEST_EVENT_ID
     
+    # Gebruik de cached waarde als die bestaat
     if LATEST_EVENT_ID is not None:
         return LATEST_EVENT_ID
     
+    # Standaard waarde voor als alles faalt
+    default_id = 1251
+    
     try:
         # Scrape de UFC site voor de meest recente event ID
-        response = requests.get("https://www.ufc.com/events")
+        response = safe_request("https://www.ufc.com/events")
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
             
@@ -60,119 +78,141 @@ def get_latest_ufc_event_id():
                 # Pak de URL en haal de event ID eruit
                 event_url = event_links[0]['href']
                 if event_url.startswith('/event/'):
-                    # Scrape het event om het FMID te krijgen
-                    event = scrape_event_url(f"https://www.ufc.com{event_url}")
-                    if event and hasattr(event, 'fmid'):
-                        LATEST_EVENT_ID = event.fmid
-                        return event.fmid
+                    try:
+                        # Scrape het event om het FMID te krijgen
+                        event = scrape_event_url(f"https://www.ufc.com{event_url}")
+                        if event and hasattr(event, 'fmid'):
+                            LATEST_EVENT_ID = event.fmid
+                            return event.fmid
+                    except Exception as e:
+                        print(f"Error scraping event URL: {e}")
         
         # Als we hier komen, konden we geen event ID vinden, gebruik een standaard waarde
-        return 1251  # Standaard UFC event ID als fallback
+        return default_id
     except Exception as e:
         print(f"Error finding latest event: {e}")
-        return 1251  # Standaard UFC event ID als fallback
+        return default_id
 
 # Haal het laatste afgelopen UFC event ID op
 def get_last_completed_event_id():
     global LAST_COMPLETED_EVENT_ID
     
+    # Gebruik de cached waarde als die bestaat
     if LAST_COMPLETED_EVENT_ID is not None:
         return LAST_COMPLETED_EVENT_ID
+    
+    # Standaard waarde voor als alles faalt
+    default_id = 1250
     
     try:
         # Probeer eerst de nieuwste event te krijgen
         latest_id = get_latest_ufc_event_id()
         
         # Controleer of de nieuwste event al afgelopen is
-        latest_event = get_event_with_cache(latest_id)
-        if latest_event.status == 'Completed':
-            LAST_COMPLETED_EVENT_ID = latest_id
-            return latest_id
+        try:
+            latest_event = get_event_with_cache(latest_id)
+            if latest_event.status == 'Completed':
+                LAST_COMPLETED_EVENT_ID = latest_id
+                return latest_id
+        except:
+            pass
         
         # Zo niet, dan zoeken we naar het laatste afgelopen event (meestal latest_id - 1)
-        for event_id in range(latest_id - 1, latest_id - 10, -1):
+        for event_id in range(latest_id - 1, latest_id - 5, -1):
             try:
                 event = get_event_with_cache(event_id)
-                if event.status == 'Completed':
+                if event and event.status == 'Completed':
                     LAST_COMPLETED_EVENT_ID = event_id
                     return event_id
             except:
                 continue
         
         # Als we geen afgelopen event kunnen vinden, use a fallback
-        return 1250  # Een oudere event ID als fallback
+        return default_id
     except Exception as e:
         print(f"Error finding last completed event: {e}")
-        return 1250  # Een oudere event ID als fallback
+        return default_id
 
 # Cache een event
 def cache_event(event_id, event):
     global EVENT_CACHE
     
-    # Voeg toe aan cache
-    EVENT_CACHE[event_id] = {
-        "timestamp": datetime.now(),
-        "event": event
-    }
-    
-    # Houd cache grootte in de gaten
-    if len(EVENT_CACHE) > MAX_CACHE_SIZE:
-        # Verwijder de oudste entry
-        oldest = min(EVENT_CACHE.items(), key=lambda x: x[1]["timestamp"])
-        del EVENT_CACHE[oldest[0]]
+    try:
+        # Voeg toe aan cache
+        EVENT_CACHE[event_id] = {
+            "timestamp": datetime.now(),
+            "event": event
+        }
+        
+        # Houd cache grootte in de gaten
+        if len(EVENT_CACHE) > MAX_CACHE_SIZE:
+            # Verwijder de oudste entry
+            oldest = min(EVENT_CACHE.items(), key=lambda x: x[1]["timestamp"])
+            del EVENT_CACHE[oldest[0]]
+    except Exception as e:
+        print(f"Error caching event: {e}")
 
 # Scrape een event met caching
 def get_event_with_cache(event_id):
     global EVENT_CACHE
     
-    # Controleer of het event in de cache zit en niet te oud is
-    if event_id in EVENT_CACHE:
-        cached = EVENT_CACHE[event_id]
-        # Als de cache minder dan een uur oud is, gebruik deze
-        if (datetime.now() - cached["timestamp"]).total_seconds() < 3600:
-            return cached["event"]
-    
-    # Anders, scrape het event
-    event = scrape_event_fmid(event_id)
-    
-    # Cache het event
-    cache_event(event_id, event)
-    
-    # Sla het event op in de geschiedenis als het volledig is
-    if event.status == 'Completed':
-        history = load_history()
-        history[str(event_id)] = {
-            "name": event.name,
-            "date": str(event.card_segments[0].start_time if event.card_segments else None),
-            "segments": [{
-                "name": segment.name,
-                "fights": [{
-                    "fighters": [fs.fighter.name for fs in fight.fighters_stats],
-                    "result": {
-                        "method": fight.result.method if fight.result else None,
-                        "ending_round": fight.result.ending_round if fight.result else None,
-                        "ending_time": str(fight.result.ending_time) if fight.result else None
-                    } if fight.result else None
-                } for fight in segment.fights]
-            } for segment in event.card_segments]
-        }
-        save_history(history)
-    
-    return event
+    try:
+        # Controleer of het event in de cache zit en niet te oud is
+        if event_id in EVENT_CACHE:
+            cached = EVENT_CACHE[event_id]
+            # Als de cache minder dan een uur oud is, gebruik deze
+            if (datetime.now() - cached["timestamp"]).total_seconds() < 3600:
+                return cached["event"]
+        
+        # Anders, scrape het event
+        event = scrape_event_fmid(event_id)
+        if not event:
+            raise ValueError(f"Failed to scrape event with ID {event_id}")
+        
+        # Cache het event
+        cache_event(event_id, event)
+        
+        # Sla het event op in de geschiedenis als het volledig is
+        if event.status == 'Completed':
+            try:
+                history = load_history()
+                history[str(event_id)] = {
+                    "name": event.name,
+                    "date": str(event.card_segments[0].start_time if event.card_segments else None),
+                    "segments": [{
+                        "name": segment.name,
+                        "fights": [{
+                            "fighters": [fs.fighter.name for fs in fight.fighters_stats],
+                            "result": {
+                                "method": fight.result.method if fight.result else None,
+                                "ending_round": fight.result.ending_round if fight.result else None,
+                                "ending_time": str(fight.result.ending_time) if fight.result else None
+                            } if fight.result else None
+                        } for fight in segment.fights]
+                    } for segment in event.card_segments]
+                }
+                save_history(history)
+            except Exception as e:
+                print(f"Error saving event to history: {e}")
+        
+        return event
+    except Exception as e:
+        print(f"Error getting event with cache: {e}")
+        raise
 
-# Achtergrond taak om periodiek events te controleren en bij te werken
-def background_task():
-    while True:
-        try:
-            # Haal de meest recente event ID op
-            latest_id = get_latest_ufc_event_id()
-            
-            # Update de cache met de nieuwste event
-            if latest_id:
+# Enkele update functie zonder oneindige loop
+def update_events_once():
+    try:
+        # Haal de meest recente event ID op
+        latest_id = get_latest_ufc_event_id()
+        
+        # Update de cache met de nieuwste event (als het id is gevonden)
+        if latest_id:
+            try:
                 event = get_event_with_cache(latest_id)
                 
                 # Als het een voltooide event is, probeer ook de volgende te vinden
-                if event.status == 'Completed':
+                if event and event.status == 'Completed':
                     # Update de LAST_COMPLETED_EVENT_ID
                     global LAST_COMPLETED_EVENT_ID
                     LAST_COMPLETED_EVENT_ID = latest_id
@@ -185,22 +225,46 @@ def background_task():
                             # Update de LATEST_EVENT_ID als we een nieuwere event vinden
                             global LATEST_EVENT_ID
                             LATEST_EVENT_ID = latest_id + 1
-                    except:
-                        pass
+                    except Exception as e:
+                        print(f"Error finding next event: {e}")
                 else:
                     # Probeer het laatste afgelopen event te vinden
-                    get_last_completed_event_id()
-        except Exception as e:
-            print(f"Error in background task: {e}")
-        
-        # Wacht 30 minuten voor de volgende controle
-        time.sleep(1800)
+                    try:
+                        get_last_completed_event_id()
+                    except Exception as e:
+                        print(f"Error finding last completed event in background: {e}")
+            except Exception as e:
+                print(f"Error processing latest event: {e}")
+    except Exception as e:
+        print(f"Error updating events: {e}")
 
-# Start de achtergrond taak
-threading.Thread(target=background_task, daemon=True).start()
+# Voorbereidende functie die de cache initialiseert
+def initialize_cache():
+    try:
+        # Probeer de meest recente event te laden
+        latest_id = get_latest_ufc_event_id()
+        get_event_with_cache(latest_id)
+        
+        # Probeer het laatste afgelopen event te laden
+        get_last_completed_event_id()
+    except Exception as e:
+        print(f"Error initializing cache: {e}")
+
+# Update de events bij elke request indien nodig
+@app.before_request
+def check_update_events():
+    if not EVENT_CACHE:
+        # Als de cache leeg is, initialiseer deze
+        try:
+            initialize_cache()
+        except:
+            pass
 
 @app.route('/')
 def home():
+    # Probeer een update te doen, maar laat de gebruiker niet wachten
+    threading.Thread(target=update_events_once, daemon=True).start()
+    
     return jsonify({
         "status": "online",
         "message": "UFC Data API is running",
@@ -434,4 +498,6 @@ def get_fights_schedule():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    # Initialiseer de cache
+    initialize_cache()
     app.run(host='0.0.0.0', port=port)

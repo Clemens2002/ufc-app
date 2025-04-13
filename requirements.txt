@@ -1,6 +1,7 @@
-flask
+flask==1.1.4
 -e git+https://github.com/Clemens2002/ufc-data-scraper.git#egg=ufc_data_scraper
 gunicorn
 pytz
 beautifulsoup4
 requests
+markupsafe==2.0.1
