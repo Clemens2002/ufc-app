@@ -10,6 +10,59 @@ DEFAULT_LAST_EVENT_ID = 1250
 DEFAULT_CURRENT_EVENT_ID = 1251
 DEFAULT_NEXT_EVENT_ID = 1252
 
+def is_fight_live(fight, segment, event):
+    """
+    Bepaal of een gevecht momenteel live is gebaseerd op:
+    - Event status is "In Progress"
+    - Gevechtsresultaat is nog niet bekend
+    - Segment is begonnen
+    """
+    try:
+        # Als het event niet bezig is, dan is geen enkel gevecht live
+        if event.status != "In Progress":
+            return False
+        
+        # Als het gevecht een resultaat heeft, is het voorbij
+        if fight.result and fight.result.method:
+            return False
+        
+        current_time = datetime.now(pytz.UTC)
+        
+        # Als het segment nog niet begonnen is, is het gevecht niet live
+        if segment.start_time and segment.start_time > current_time:
+            return False
+        
+        # Nu moeten we bepalen welk gevecht in het segment momenteel plaatsvindt
+        # We vinden de index van dit gevecht in de lijst van gevechten
+        fight_index = -1
+        for i, f in enumerate(segment.fights):
+            if f == fight:
+                fight_index = i
+                break
+        
+        if fight_index == -1:
+            return False
+            
+        # Controleer voorgaande gevechten in hetzelfde segment
+        for i in range(0, fight_index):
+            prev_fight = segment.fights[i]
+            # Als een voorgaand gevecht nog geen resultaat heeft, dan is dit gevecht nog niet begonnen
+            if not prev_fight.result or not prev_fight.result.method:
+                return False
+                
+        # Controleer of er een volgend gevecht in hetzelfde segment is
+        # dat al wel een resultaat heeft (dan is dit gevecht al voorbij)
+        if fight_index < len(segment.fights) - 1:
+            next_fight = segment.fights[fight_index + 1]
+            if next_fight.result and next_fight.result.method:
+                return False
+                
+        # Als aan alle voorwaarden is voldaan, is dit gevecht waarschijnlijk live
+        return True
+    except:
+        # Als er een fout optreedt, gaan we ervan uit dat het gevecht niet live is
+        return False
+
 @app.route('/')
 def home():
     try:
@@ -31,6 +84,8 @@ def home():
                     output.append("   ✅ Result: {}".format(fight.result.method))
                     output.append("   ⏱️  Ended in round {} at {}".format(
                         fight.result.ending_round, fight.result.ending_time))
+                elif is_fight_live(fight, segment, event):
+                    output.append("   🔴 LIVE NOW")
                 else:
                     output.append("   🕒 Status: Not yet finished")
                 
@@ -41,6 +96,9 @@ def home():
         output.append("  - /event/1250 (Vorig event)")
         output.append("  - /event/1251 (Huidig event)")
         output.append("  - /event/1252 (Volgend event)")
+        
+        # Voeg timestamp toe voor verse data
+        output.append("\n🕒 Last Updated: {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")))
         
         # Retourneer als plain text
         return Response("\n".join(output), mimetype='text/plain')
@@ -61,26 +119,42 @@ def home():
 def get_event(event_fmid):
     try:
         event = scrape_event_fmid(event_fmid)
-        return jsonify({
+        
+        # Bereid de JSON data voor
+        result_json = {
             "name": event.name,
             "status": event.status,
-            "segments": [
-                {
-                    "name": segment.name,
-                    "start_time": str(segment.start_time),
-                    "fights": [
-                        {
-                            "fighters": [fs.fighter.name for fs in fight.fighters_stats],
-                            "result": {
-                                "method": fight.result.method if fight.result else None,
-                                "ending_round": fight.result.ending_round if fight.result else None,
-                                "ending_time": str(fight.result.ending_time) if fight.result else None
-                            } if fight.result else {"status": "Not yet finished"}
-                        } for fight in segment.fights
-                    ]
-                } for segment in event.card_segments
-            ]
-        })
+            "segments": []
+        }
+        
+        for segment in event.card_segments:
+            segment_data = {
+                "name": segment.name,
+                "start_time": str(segment.start_time),
+                "fights": []
+            }
+            
+            for fight in segment.fights:
+                fight_data = {
+                    "fighters": [fs.fighter.name for fs in fight.fighters_stats]
+                }
+                
+                if fight.result:
+                    fight_data["result"] = {
+                        "method": fight.result.method,
+                        "ending_round": fight.result.ending_round,
+                        "ending_time": str(fight.result.ending_time)
+                    }
+                elif is_fight_live(fight, segment, event):
+                    fight_data["status"] = "LIVE NOW"
+                else:
+                    fight_data["status"] = "Not yet finished"
+                
+                segment_data["fights"].append(fight_data)
+            
+            result_json["segments"].append(segment_data)
+        
+        return jsonify(result_json)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
